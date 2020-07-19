@@ -4,10 +4,10 @@
 #![warn(missing_docs, missing_debug_implementations, rust_2018_idioms)]
 
 use std::cell::Cell;
+use std::fmt;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::panic::{RefUnwindSafe, UnwindSafe};
-use std::fmt;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -171,8 +171,8 @@ impl<T> Future for Task<T> {
 /// A single-threaded executor.
 #[derive(Debug)]
 pub struct LocalExecutor {
-    /// The task queue.
-    queue: Arc<ConcurrentQueue<Runnable>>,
+    /// The LocalTicker containing the task queue.
+    ticker: LocalTicker,
 
     /// Callback invoked to wake the executor up.
     callback: Callback,
@@ -196,8 +196,9 @@ impl LocalExecutor {
     /// let ex = LocalExecutor::new(move || u.unpark());
     /// ```
     pub fn new(notify: impl Fn() + Send + Sync + 'static) -> LocalExecutor {
+        let queue = Arc::new(ConcurrentQueue::unbounded());
         LocalExecutor {
-            queue: Arc::new(ConcurrentQueue::unbounded()),
+            ticker: LocalTicker { queue },
             callback: Callback::new(notify),
             _marker: PhantomData,
         }
@@ -218,7 +219,7 @@ impl LocalExecutor {
     /// let task = ex.spawn(async { println!("hello") });
     /// ```
     pub fn spawn<T: 'static>(&self, future: impl Future<Output = T> + 'static) -> Task<T> {
-        let queue = self.queue.clone();
+        let queue = self.ticker.queue.clone();
         let callback = self.callback.clone();
 
         // The function that schedules a runnable task when it gets woken up.
@@ -231,6 +232,11 @@ impl LocalExecutor {
         let (runnable, handle) = async_task::spawn_local(future, schedule, ());
         runnable.schedule();
         Task(Some(handle))
+    }
+
+    /// Create a LocalTicker to delegate the tick operations.
+    pub fn ticker(&self) -> LocalTicker {
+        self.ticker.clone()
     }
 
     /// Runs a single task and returns `true` if one was found.
@@ -250,6 +256,43 @@ impl LocalExecutor {
     /// assert!(ex.tick());
     /// ```
     pub fn tick(&self) -> bool {
+        self.ticker.tick()
+    }
+}
+
+impl Drop for LocalExecutor {
+    fn drop(&mut self) {
+        // TODO(stjepang): Close the local queue and empty it.
+        // TODO(stjepang): Cancel all remaining tasks.
+    }
+}
+
+/// Runs tasks in a single-threaded executor.
+#[derive(Debug)]
+pub struct LocalTicker {
+    /// The task queue.
+    queue: Arc<ConcurrentQueue<Runnable>>,
+}
+
+impl LocalTicker {
+    /// Runs a single task and returns `true` if one was found.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use multitask::LocalExecutor;
+    ///
+    /// let (p, u) = parking::pair();
+    /// let ex = LocalExecutor::new(move || u.unpark());
+    /// let ticker = ex.ticker();
+    ///
+    /// assert!(!ticker.tick());
+    /// let task = ex.spawn(async { println!("hello") });
+    ///
+    /// // This prints "hello".
+    /// assert!(ticker.tick());
+    /// ```
+    pub fn tick(&self) -> bool {
         if let Ok(r) = self.queue.pop() {
             r.run();
             true
@@ -259,10 +302,14 @@ impl LocalExecutor {
     }
 }
 
-impl Drop for LocalExecutor {
-    fn drop(&mut self) {
-        // TODO(stjepang): Close the local queue and empty it.
-        // TODO(stjepang): Cancel all remaining tasks.
+impl UnwindSafe for LocalTicker {}
+impl RefUnwindSafe for LocalTicker {}
+
+impl Clone for LocalTicker {
+    fn clone(&self) -> Self {
+        Self {
+            queue: self.queue.clone(),
+        }
     }
 }
 
@@ -682,7 +729,6 @@ impl Eq for Callback {}
 
 impl fmt::Debug for Callback {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("<callback>")
-            .finish()
+        f.debug_struct("<callback>").finish()
     }
 }
