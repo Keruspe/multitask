@@ -360,7 +360,7 @@ impl Sleepers {
 /// A multi-threaded executor.
 #[derive(Debug)]
 pub struct Executor {
-    global: Arc<Global>,
+    spawner: Spawner,
 }
 
 impl UnwindSafe for Executor {}
@@ -378,15 +378,33 @@ impl Executor {
     /// ```
     pub fn new() -> Executor {
         Executor {
-            global: Arc::new(Global {
-                queue: ConcurrentQueue::unbounded(),
-                shards: RwLock::new(Vec::new()),
-                notified: AtomicBool::new(true),
-                sleepers: Mutex::new(Sleepers {
-                    count: 0,
-                    callbacks: Vec::new(),
+            spawner: Spawner {
+                global: Arc::new(Global {
+                    queue: ConcurrentQueue::unbounded(),
+                    shards: RwLock::new(Vec::new()),
+                    notified: AtomicBool::new(true),
+                    sleepers: Mutex::new(Sleepers {
+                        count: 0,
+                        callbacks: Vec::new(),
+                    }),
                 }),
-            }),
+            },
+        }
+    }
+
+    /// Creates a spawner for this executor.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use multitask::Executor;
+    ///
+    /// let ex = Executor::new();
+    /// let spawner = ex.spawner();
+    /// ```
+    pub fn spawner(&self) -> Spawner {
+        Spawner {
+            global: self.spawner.global.clone(),
         }
     }
 
@@ -406,18 +424,7 @@ impl Executor {
         &self,
         future: impl Future<Output = T> + Send + 'static,
     ) -> Task<T> {
-        let global = self.global.clone();
-
-        // The function that schedules a runnable task when it gets woken up.
-        let schedule = move |runnable| {
-            global.queue.push(runnable).unwrap();
-            global.notify();
-        };
-
-        // Create a task, push it into the queue by scheduling it, and return its `Task` handle.
-        let (runnable, handle) = async_task::spawn(future, schedule, ());
-        runnable.schedule();
-        Task(Some(handle))
+        self.spawner.spawn(future)
     }
 
     /// Creates a new ticker for executing tasks.
@@ -454,13 +461,14 @@ impl Executor {
     pub fn ticker(&self, notify: impl Fn() + Send + Sync + 'static) -> Ticker {
         // Create a ticker and put its stealer handle into the executor.
         let ticker = Ticker {
-            global: Arc::new(self.global.clone()),
+            global: Arc::new(self.spawner.global.clone()),
             shard: Arc::new(ConcurrentQueue::bounded(512)),
             callback: Callback::new(notify),
             sleeping: Cell::new(false),
             ticks: Cell::new(0),
         };
-        self.global
+        self.spawner
+            .global
             .shards
             .write()
             .unwrap()
@@ -472,6 +480,45 @@ impl Executor {
 impl Default for Executor {
     fn default() -> Executor {
         Executor::new()
+    }
+}
+
+/// A spawner for a multi-threaded executor.
+#[derive(Debug)]
+pub struct Spawner {
+    global: Arc<Global>,
+}
+
+impl Spawner {
+    /// Spawns a future onto this executor.
+    ///
+    /// Returns a [`Task`] handle for the spawned future.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use multitask::Executor;
+    ///
+    /// let ex = Executor::new();
+    /// let spawner = ex.spawner();
+    /// let task = spawner.spawn(async { println!("hello") });
+    /// ```
+    pub fn spawn<T: Send + 'static>(
+        &self,
+        future: impl Future<Output = T> + Send + 'static,
+    ) -> Task<T> {
+        let global = self.global.clone();
+
+        // The function that schedules a runnable task when it gets woken up.
+        let schedule = move |runnable| {
+            global.queue.push(runnable).unwrap();
+            global.notify();
+        };
+
+        // Create a task, push it into the queue by scheduling it, and return its `Task` handle.
+        let (runnable, handle) = async_task::spawn(future, schedule, ());
+        runnable.schedule();
+        Task(Some(handle))
     }
 }
 
